@@ -1,0 +1,23 @@
+[server]
+listen_addr = "127.0.0.1:8080"
+
+[upstream]
+url = "http://127.0.0.1:9002"
+
+[breaker]
+requests_per_second = 50
+burst_size = 100
+
+[hitl]
+enabled = true
+high_risk_tools = ["db_delete", "db_write", "github_merge"]
+webhook_url = ""
+
+[audit]
+enabled = true
+sink = "stdout"
+
+[heartbeat]
+central_url = "http://127.0.0.1:9001"
+interval_secs = 30
+api_key = "hsk_76105cff469440c981bb12e579389fe7"

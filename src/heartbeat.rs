@@ -28,7 +28,7 @@ struct CentralConfig {
 #[derive(Deserialize, Debug)]
 struct CentralRole {
     role: String,
-    allowed_tools: String, // comma-separated from DB
+    allowed_tools: Vec<String>, // JSON array from API
 }
 
 #[derive(Deserialize, Debug)]
@@ -133,7 +133,7 @@ async fn apply_config(state: &SidecarState, cfg: CentralConfig) {
     let roles: Vec<RoleBinding> = cfg.roles.iter().map(|r| {
         RoleBinding {
             role: r.role.clone(),
-            allowed_tools: r.allowed_tools.split(',').map(|s| s.trim().to_string()).collect(),
+            allowed_tools: r.allowed_tools.clone(),
         }
     }).collect();
     {
