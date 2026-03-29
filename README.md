@@ -45,12 +45,11 @@ docker compose up --build
 ```
 
 ```
-┌─────────────────────────────────────────────┐
-│              Docker network                 │
-│                                             │
-│  Agent ──▶ hesed:8080 ──▶ mcp:3000         │
-│            (exposed)      (internal only)   │
-└─────────────────────────────────────────────┘
+                ┌───────────────────────────┐
+Agent ──▶ :8080 │  hesed ──▶ mcp:3000       │
+  (host)        │  (exposed)  (internal only)│
+                └───────────────────────────┘
+                        Docker network
 ```
 
 **4. Point your agent to Hesed:**
