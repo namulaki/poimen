@@ -6,11 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-/// Cached resolution of an agent key (hak_) → (role, project_id).
+/// Cached resolution of an agent key (hak_) → (role, project_id, allowed_tools).
 #[derive(Debug, Clone)]
 struct CachedResolution {
     role: String,
     project_id: String,
+    allowed_tools: Vec<String>,
     expires_at: std::time::Instant,
 }
 
@@ -90,6 +91,8 @@ impl SidecarState {
         struct Resolution {
             role: String,
             project_id: String,
+            #[serde(default)]
+            allowed_tools: Vec<String>,
         }
 
         let res: Resolution = resp.json().await.ok()?;
@@ -97,6 +100,7 @@ impl SidecarState {
         let cached = CachedResolution {
             role: res.role,
             project_id: res.project_id,
+            allowed_tools: res.allowed_tools,
             expires_at: std::time::Instant::now() + AGENT_KEY_CACHE_TTL,
         };
 
@@ -159,13 +163,30 @@ async fn pipeline(
         return Err(InterceptError::RateLimited);
     }
 
-    // 3. AuthZ - resolve role + project_id from agent key (single source of truth)
+    // 3. AuthZ - resolve role + project_id + allowed_tools from agent key
+    //    When an agent key is present, its resolved allowed_tools are the source of truth
+    //    (multi-project: each key carries its own project's permissions).
+    //    Without an agent key, fall back to the global config pulled via heartbeat.
     let (role, resolved_project_id) = if let Some(agent_key) = authz::extract_agent_key(req.params.as_ref()) {
         match state.resolve_agent_key(&agent_key).await {
             Some(resolution) => {
                 state.audit_logger.log(
                     &audit::AuditEvent::new(request_id, "authz", "key_resolve",
                         &format!("agent_key={} → role={} project={}", agent_key, resolution.role, resolution.project_id))
+                        .with_tool(&tool).with_role(&resolution.role)
+                ).await;
+                // Evaluate against the per-key allowed_tools (project-scoped)
+                if !authz::evaluate_tools(&resolution.allowed_tools, &tool) {
+                    state.audit_logger.log(
+                        &audit::AuditEvent::new(request_id, "authz", "deny", &format!("role={} tool={}", resolution.role, tool))
+                            .with_tool(&tool).with_role(&resolution.role)
+                    ).await;
+                    return Err(InterceptError::AuthzDenied(
+                        format!("role '{}' on tool '{}'", resolution.role, tool),
+                    ));
+                }
+                state.audit_logger.log(
+                    &audit::AuditEvent::new(request_id, "authz", "allow", &format!("role={} tool={}", resolution.role, tool))
                         .with_tool(&tool).with_role(&resolution.role)
                 ).await;
                 (resolution.role, Some(resolution.project_id))
@@ -182,24 +203,26 @@ async fn pipeline(
             }
         }
     } else {
-        (authz::extract_role(req.params.as_ref()), None)
-    };
-    {
-        let authz_cfg = state.authz.read().await;
-        if !authz::evaluate(&authz_cfg, &role, &tool) {
-            state.audit_logger.log(
-                &audit::AuditEvent::new(request_id, "authz", "deny", &format!("role={} tool={}", role, tool))
-                    .with_tool(&tool).with_role(&role)
-            ).await;
-            return Err(InterceptError::AuthzDenied(
-                format!("role '{}' on tool '{}'", role, tool),
-            ));
+        // No agent key — use global config (heartbeat-pulled or TOML)
+        let role = authz::extract_role(req.params.as_ref());
+        {
+            let authz_cfg = state.authz.read().await;
+            if !authz::evaluate(&authz_cfg, &role, &tool) {
+                state.audit_logger.log(
+                    &audit::AuditEvent::new(request_id, "authz", "deny", &format!("role={} tool={}", role, tool))
+                        .with_tool(&tool).with_role(&role)
+                ).await;
+                return Err(InterceptError::AuthzDenied(
+                    format!("role '{}' on tool '{}'", role, tool),
+                ));
+            }
         }
-    }
-    state.audit_logger.log(
-        &audit::AuditEvent::new(request_id, "authz", "allow", &format!("role={} tool={}", role, tool))
-            .with_tool(&tool).with_role(&role)
-    ).await;
+        state.audit_logger.log(
+            &audit::AuditEvent::new(request_id, "authz", "allow", &format!("role={} tool={}", role, tool))
+                .with_tool(&tool).with_role(&role)
+        ).await;
+        (role, None)
+    };
 
     // 4. DLP - sanitize request params (read from RwLock)
     let mut sanitized_req = req.clone();

@@ -13,6 +13,16 @@ pub fn evaluate(config: &AuthzConfig, role: &str, tool: &str) -> bool {
     })
 }
 
+/// Evaluate a tool against a pre-resolved list of allowed_tools (from agent key resolution).
+/// Same matching logic as `evaluate` but without needing the full config/role lookup.
+pub fn evaluate_tools(allowed_tools: &[String], tool: &str) -> bool {
+    allowed_tools.iter().any(|t| {
+        t == "*"
+            || t == tool
+            || (t.ends_with('*') && tool.starts_with(&t[..t.len() - 1]))
+    })
+}
+
 /// Extract the role from JSON-RPC request metadata (params._meta.role).
 /// Falls back to "default" if not present.
 pub fn extract_role(params: Option<&serde_json::Value>) -> String {
