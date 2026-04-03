@@ -14,10 +14,10 @@ Every JSON-RPC `tools/call` request passes through a security pipeline:
 |---|---|
 | Protocol Interceptor | Parses JSON-RPC, routes tool calls into the pipeline |
 | Circuit Breaker | Token-bucket rate limiting via `governor` — cheapest gate, runs first |
-| Policy Engine (AuthZ) | RBAC evaluation — checks if the caller's role is allowed to invoke the tool |
+| Policy Engine (AuthZ) | RBAC evaluation — resolves agent key to role and checks allowed tools |
 | Semantic Inspector (DLP) | Regex-based PII detection and redaction on both request and response payloads |
 | Human-in-the-Loop | Routes high-risk tool calls to webhook (static) or central dashboard (dynamic) for approval |
-| Audit Logger | Logs every decision to stdout, file, or central dashboard |
+| Audit Logger | Logs every decision to stdout, file, webhook, or central dashboard |
 
 Non-tool-call methods (e.g. `tools/list`, `resources/read`) are passed through to upstream unmodified.
 
@@ -123,6 +123,9 @@ mode = "static"   # or just omit — static is the default
 
 [server]
 listen_addr = "127.0.0.1:8080"
+max_request_body_bytes = 1048576   # optional, default 1 MiB
+shutdown_timeout_secs = 30         # optional, default 30
+cache_max_entries = 10000          # optional, default 10000
 
 [upstream]
 url = "http://127.0.0.1:3000"
@@ -188,6 +191,15 @@ interval_secs = 30
 api_key = "hsk_your_api_key_here"
 ```
 
+### Server config reference
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `listen_addr` | string | (required) | Address and port to listen on |
+| `max_request_body_bytes` | integer | `1048576` (1 MiB) | Maximum request body size. Requests exceeding this are rejected with a JSON-RPC error. |
+| `shutdown_timeout_secs` | integer | `30` | Seconds to wait for in-flight connections to drain on SIGTERM/SIGINT before force-closing. |
+| `cache_max_entries` | integer | `10000` | Maximum entries in the agent key resolution cache (LRU eviction). |
+
 ## Error Handling
 
 The pipeline uses a typed `InterceptError` enum. Each stage returns a specific error variant, which is automatically converted into a JSON-RPC error response with the correct error code:
@@ -195,7 +207,8 @@ The pipeline uses a typed `InterceptError` enum. Each stage returns a specific e
 | Error | Code | When |
 |---|---|---|
 | `InvalidPayload` | -32700 | Malformed JSON-RPC request |
-| `AuthzDenied` | -32600 | Role not authorized for the requested tool |
+| `BodyTooLarge` | -32600 | Request body exceeds `max_request_body_bytes` |
+| `AuthzDenied` | -32600 | Role not authorized for the requested tool, or missing/invalid agent key |
 | `RateLimited` | -32000 | Token bucket exhausted |
 | `ApprovalDenied` | -32001 | HITL webhook rejected or failed |
 | `Upstream` | -32603 | MCP tool server unreachable or errored |
@@ -215,13 +228,27 @@ Example error response:
 
 ## How Roles Work
 
-The sidecar resolves the caller's role in this order:
+All `tools/call` requests require an agent key (`hak_` prefix) in the `_meta.agent_key` field of the JSON-RPC params. The sidecar resolves the agent key to a role and project-scoped allowed tools via the central backend.
 
-1. Agent key (`hak_` prefix in `_meta.agent_key`) — resolved to a role via the central backend (dynamic mode only)
-2. `_meta.role` field in the JSON-RPC params
-3. Falls back to `"default"`
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "db_read",
+    "_meta": {
+      "agent_key": "hak_abc123..."
+    }
+  }
+}
+```
+
+Requests without an agent key are rejected with `AuthzDenied`. The resolved role and allowed tools are cached locally with a 5-minute TTL in a bounded LRU cache (max `cache_max_entries` entries).
 
 In static mode, roles and allowed tools are defined in `[authz.roles]` in the TOML. In dynamic mode, they're managed in the poimen-pro dashboard and synced via heartbeat.
+
+Wildcard matching is supported: `"*"` allows all tools, and prefix wildcards like `"poimen_*"` match any tool starting with `poimen_`.
 
 ## Human-in-the-Loop
 
@@ -234,19 +261,30 @@ When a tool is listed as high-risk, the sidecar pauses execution and requests hu
 
 If the approval is denied or errors out, the request is rejected with `ApprovalDenied`.
 
+## Graceful Shutdown
+
+The sidecar handles `SIGTERM` and `SIGINT` signals for graceful shutdown:
+
+1. Stops accepting new TCP connections
+2. Waits for in-flight requests to complete (up to `shutdown_timeout_secs`, default 30s)
+3. Force-closes remaining connections if the timeout is reached
+4. Exits cleanly
+
+This ensures `docker stop` and Kubernetes pod termination drain active connections instead of hard-killing them.
+
 ## Project Structure
 
 ```
 src/
-├── main.rs          # HTTP server entrypoint (hyper)
-├── proxy.rs         # Pipeline orchestration with RwLock-guarded dynamic config
+├── main.rs          # HTTP server, body size limit, graceful shutdown (hyper)
+├── proxy.rs         # Pipeline orchestration, LRU agent key cache, RwLock-guarded config
 ├── interceptor.rs   # JSON-RPC types, InterceptError enum, parsing
-├── authz.rs         # RBAC policy engine
+├── authz.rs         # RBAC policy engine with wildcard support
 ├── dlp.rs           # PII/payload regex scanner & redactor
 ├── breaker.rs       # Rate limiter (governor)
-├── hitl.rs          # Human-in-the-loop (webhook + central dashboard)
+├── hitl.rs          # Human-in-the-loop (webhook + central dashboard polling)
 ├── heartbeat.rs     # Heartbeat + config-pull from central (dynamic mode)
-├── audit.rs         # Audit event logger
+├── audit.rs         # Audit event logger (stdout, file, webhook, central)
 └── config.rs        # TOML config loader + ConfigMode enum
 ```
 
