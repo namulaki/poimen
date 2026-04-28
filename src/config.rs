@@ -152,7 +152,11 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let mut config: Config = if path.exists() {
             let content = std::fs::read_to_string(path)?;
-            toml::from_str(&content)?
+            if content.trim().is_empty() {
+                Config::minimal_default()
+            } else {
+                toml::from_str(&content)?
+            }
         } else {
             Config::minimal_default()
         };
